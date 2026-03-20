@@ -2,6 +2,7 @@ import { withPluginApi } from "discourse/lib/plugin-api";
 
 const HEADER_BEGINNING = 'OCTOSTUDIO';
 const ZIP_START_BYTE = HEADER_BEGINNING.length;
+const OCTOSTUDIO_MIME_TYPE = "application/octet-stream";
 
 function unpackProject(byteArray) {
   const textDecoder = new TextDecoder();
@@ -116,6 +117,48 @@ export default {
             } catch (e) {
               console.error("[OctoStudio Viewer] Processing failed:", e.message);
             }
+
+            link.addEventListener("click", async (event) => {
+                // Verifica se o clique foi diretamente no link (ignora cliques no preview de imagem)
+                if (event.target.tagName.toLowerCase() !== 'a') return;
+                
+                event.preventDefault();
+
+                try {
+                  const response = await fetch(link.href);
+                  if (!response.ok) throw new Error(`HTTP Status: ${response.status}`);
+
+                  const arrayBuffer = await response.arrayBuffer();
+                  
+                  // Recria o arquivo na memória do navegador forçando o novo MIME Type
+                  const blob = new Blob([arrayBuffer], { type: OCTOSTUDIO_MIME_TYPE });
+                  console.log("[MIME Test] Tipo do Blob gerado:", blob.type);
+                  const blobUrl = URL.createObjectURL(blob);
+
+                  // Cria um elemento <a> temporário para forçar o download pelo navegador
+                  const tempLink = document.createElement("a");
+                  tempLink.href = blobUrl;
+                  
+                  // Extrai o nome original do arquivo da URL ou define um fallback
+                  const urlParts = link.href.split('/');
+                  const fileName = urlParts[urlParts.length - 1].split('?')[0] || "project.octostudio";
+                  tempLink.download = fileName;
+
+                  // Aciona o download
+                  document.body.appendChild(tempLink);
+                  tempLink.click();
+
+                  // Limpeza de memória e remoção do elemento temporário
+                  document.body.removeChild(tempLink);
+                  setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+
+                } catch (e) {
+                  console.error("[OctoStudio Viewer] Falha ao interceptar download:", e.message);
+                  // Fallback: executa o comportamento padrão caso a interceptação falhe
+                  window.location.href = link.href;
+                }
+              });
+
           });
         },
         { id: "octostudio-handler" }
