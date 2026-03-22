@@ -1,8 +1,11 @@
 import { withPluginApi } from "discourse/lib/plugin-api";
 
+// Feature Flag: Toggle to 'true' when the OctoStudio app is updated to support the intent/UTI
+const ENABLE_WEB_SHARE_API = true; 
+
 const HEADER_BEGINNING = 'OCTOSTUDIO';
 const ZIP_START_BYTE = HEADER_BEGINNING.length;
-const OCTOSTUDIO_MIME_TYPE = "application/octet-stream";
+const OCTOSTUDIO_MIME_TYPE = "application/x-octostudio";
 
 function unpackProject(byteArray) {
   console.log("[OctoStudio Viewer] Unpacking project bytes...");
@@ -50,7 +53,8 @@ function unpackProject(byteArray) {
 export default {
   name: "octostudio-viewer",
   initialize() {
-    console.log("[OctoStudio Viewer] Version 20260321.2044");
+    console.log("[OctoStudio Viewer] Version 20260322.0100");
+    console.log(`[OctoStudio Viewer] Web Share API integration is currently: ${ENABLE_WEB_SHARE_API ? 'ENABLED' : 'DISABLED'}`);
     
     withPluginApi("0.8.31", (api) => {
       api.decorateCookedElement(
@@ -142,7 +146,7 @@ export default {
               console.error("[OctoStudio Viewer] Preview rendering failed completely: ", e);
             }
 
-            // 3. CLICK INTERCEPTION: Pure Blob download execution
+            // 3. CLICK INTERCEPTION: File transfer logic
             link.addEventListener("click", async (event) => {
               console.log("[OctoStudio Viewer] Click event fired.");
               
@@ -199,24 +203,57 @@ export default {
                   console.log(`[OctoStudio Viewer] Valid filename extracted: ${fileName}`);
                 }
 
-                // Blob Creation & Download Trigger
-                console.log(`[OctoStudio Viewer] Creating Blob with MIME type: ${OCTOSTUDIO_MIME_TYPE}`);
-                const blob = new Blob([buffer], { type: OCTOSTUDIO_MIME_TYPE });
-                const blobUrl = URL.createObjectURL(blob);
+                let sharedNatively = false;
 
-                const tempLink = document.createElement("a");
-                tempLink.href = blobUrl;
-                tempLink.download = fileName;
+                // Attempt Web Share API if enabled and supported by the browser engine
+                if (ENABLE_WEB_SHARE_API && navigator.canShare) {
+                  console.log("[OctoStudio Viewer] Web Share API enabled. Evaluating file support...");
+                  const shareFile = new File([buffer], fileName, { type: OCTOSTUDIO_MIME_TYPE });
+                  const shareData = { files: [shareFile] };
+                  
+                  if (navigator.canShare(shareData)) {
+                    console.log("[OctoStudio Viewer] File validation passed. Triggering await navigator.share().");
+                    try {
+                      // Execution will wait indefinitely until the user closes the menu or selects an app
+                      await navigator.share(shareData);
+                      sharedNatively = true;
+                      console.log("[OctoStudio Viewer] Native Share Sheet successfully concluded.");
+                    } catch (error) {
+                      if (error.name === 'AbortError') {
+                        console.log("[OctoStudio Viewer] Share Sheet actively aborted by user.");
+                        return; // Interrupts the flow and proceeds to the finally block
+                      } else {
+                        // Catches NotAllowedError (loss of transient activation) or DataError
+                        console.warn("[OctoStudio Viewer] Web Share API rejected. Triggering fallback logic.", error);
+                      }
+                    }
+                  } else {
+                    console.log("[OctoStudio Viewer] navigator.canShare(data) rejected the file object. Triggering fallback logic.");
+                  }
+                } else if (!ENABLE_WEB_SHARE_API) {
+                  console.log("[OctoStudio Viewer] Web Share API disabled by feature flag. Proceeding to Blob download.");
+                }
 
-                console.log("[OctoStudio Viewer] Injecting temporary anchor to trigger OS download...");
-                document.body.appendChild(tempLink);
-                tempLink.click();
-                document.body.removeChild(tempLink);
-              
-                setTimeout(() => {
-                  URL.revokeObjectURL(blobUrl);
-                  console.log("[OctoStudio Viewer] Blob URL revoked to free memory.");
-                }, 1000);
+                // Fallback: Blob Creation & OS Download Trigger
+                if (!sharedNatively) {
+                  console.log(`[OctoStudio Viewer] Creating Blob with MIME type: ${OCTOSTUDIO_MIME_TYPE}`);
+                  const blob = new Blob([buffer], { type: OCTOSTUDIO_MIME_TYPE });
+                  const blobUrl = URL.createObjectURL(blob);
+
+                  const tempLink = document.createElement("a");
+                  tempLink.href = blobUrl;
+                  tempLink.download = fileName;
+
+                  console.log("[OctoStudio Viewer] Injecting temporary anchor to trigger OS download...");
+                  document.body.appendChild(tempLink);
+                  tempLink.click();
+                  document.body.removeChild(tempLink);
+                
+                  setTimeout(() => {
+                    URL.revokeObjectURL(blobUrl);
+                    console.log("[OctoStudio Viewer] Blob URL revoked to free memory.");
+                  }, 1000);
+                }
 
               } catch (e) {
                 console.error("[OctoStudio Viewer] Critical failure during file processing/download: ", e);
