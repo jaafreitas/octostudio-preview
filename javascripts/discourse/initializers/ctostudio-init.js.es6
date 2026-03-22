@@ -5,11 +5,13 @@ const ZIP_START_BYTE = HEADER_BEGINNING.length;
 const OCTOSTUDIO_MIME_TYPE = "application/octet-stream";
 
 function unpackProject(byteArray) {
+  console.log("[OctoStudio Viewer] Unpacking project bytes...");
   const textDecoder = new TextDecoder();
   const beginning = textDecoder.decode(byteArray.subarray(0, HEADER_BEGINNING.length));
 
   if (beginning !== HEADER_BEGINNING) {
-    throw new Error("Signature OCTOSTUDIO not found.");
+    console.error("[OctoStudio Viewer] Invalid signature. Expected 'OCTOSTUDIO', found:", beginning);
+    throw new Error("OCTOSTUDIO signature not found.");
   }
 
   const zipStartPos = (
@@ -19,7 +21,10 @@ function unpackProject(byteArray) {
     (byteArray[ZIP_START_BYTE + 3] << 24)
   ) >>> 0;
 
+  console.log(`[OctoStudio Viewer] ZIP start position detected at byte: ${zipStartPos}`);
+
   let zipEndPos = -1;
+  // Searching for End of Central Directory (EOCD) signature
   for (let i = byteArray.length - 22; i >= zipStartPos; i--) {
     if (
       byteArray[i] === 0x50 &&
@@ -29,30 +34,35 @@ function unpackProject(byteArray) {
     ) {
       const commentLength = byteArray[i + 20] | (byteArray[i + 21] << 8);
       zipEndPos = i + 22 + commentLength;
+      console.log(`[OctoStudio Viewer] EOCD signature found. ZIP end position: ${zipEndPos}`);
       break;
     }
   }
 
   if (zipEndPos === -1) {
-    throw new Error("EOCD signature not found. File might be truncated.");
+    console.error("[OctoStudio Viewer] EOCD signature missing. File might be truncated or corrupted.");
+    throw new Error("EOCD signature not found.");
   }
 
   return byteArray.slice(zipStartPos, zipEndPos);
 }
 
 export default {
-  name: "octostudio-preview-init",
+  name: "octostudio-viewer",
   initialize() {
+    console.log("[OctoStudio Viewer] Version 20260321.2044");
+    
     withPluginApi("0.8.31", (api) => {
       api.decorateCookedElement(
         async (element) => {
           const links = element.querySelectorAll('a.attachment[href*=".octostudio"]');
           if (!links.length) return;
 
-          // JSZip is loaded via script tag in header.html
+          console.log(`[OctoStudio Viewer] Found ${links.length} .octostudio attachment(s) in the post.`);
+
           const JSZip = window.JSZip;
           if (!JSZip) {
-            console.error("[OctoStudio Viewer] JSZip library not found.");
+            console.error("[OctoStudio Viewer] JSZip library is missing from the global window object. Aborting.");
             return;
           }
 
@@ -60,44 +70,54 @@ export default {
             if (link.dataset.octoProcessed) return;
             link.dataset.octoProcessed = "true";
 
+            // 1. DOM HIJACKING: Prevent default routing and pre-fetch link data
+            const originalUrl = link.href;
+            link.dataset.targetUrl = originalUrl;
+            link.href = "javascript:void(0);";
+            console.log(`[OctoStudio Viewer] Link hijacked. Target URL stored: ${originalUrl}`);
+
+            // 2. PREVIEW RENDER: Extract thumbnail silently in the background
             try {
-              const response = await fetch(link.href);
-              if (!response.ok) throw new Error(`HTTP Error: ${response.status}`);
+              console.log(`[OctoStudio Viewer] Fetching file for preview extraction: ${originalUrl}`);
+              const response = await fetch(originalUrl);
+              
+              if (!response.ok) {
+                console.error(`[OctoStudio Viewer] Preview fetch failed. HTTP Status: ${response.status}`);
+                throw new Error(`HTTP Error: ${response.status}`);
+              }
               
               const arrayBuffer = await response.arrayBuffer();
               const byteArray = new Uint8Array(arrayBuffer);
+              console.log(`[OctoStudio Viewer] Preview payload received. Size: ${byteArray.byteLength} bytes.`);
 
               const zipBuffer = unpackProject(byteArray);
               const zip = await JSZip.loadAsync(zipBuffer);
+              console.log("[OctoStudio Viewer] JSZip loaded successfully.");
 
-              // Extract metadata
               const dataFile = zip.file("project/data.json");
               let thumbFileName = null;
 
               if (dataFile) {
                 const jsonString = await dataFile.async("string");
                 const projectData = JSON.parse(jsonString);
-                
-                console.log("[OctoStudio Viewer] Project Metadata:", {
-                  name: projectData.name,
-                  title: projectData.title,
-                  notes: projectData.notes
-                });
-
                 thumbFileName = projectData.thumb || projectData.thumbnail;
+                console.log("[OctoStudio Viewer] Project metadata parsed. Expected thumbnail:", thumbFileName);
               }
 
-              // Locate thumbnail
               let thumbFile = null;
               if (thumbFileName) {
                 thumbFile = zip.file(`project/${thumbFileName}`) || zip.file(`project/thumbnails/${thumbFileName}`);
               }
 
               if (!thumbFile) {
-                const possibleThumbs = Object.keys(zip.files).filter(name => 
-                  name.startsWith("project/thumbnails/") && !zip.files[name].dir
+                console.log("[OctoStudio Viewer] Exact thumbnail match not found. Attempting fallback extraction...");
+                const autoThumbs = Object.keys(zip.files).filter(f => 
+                  f.startsWith("project/thumbnails/") && !zip.files[f].dir
                 );
-                if (possibleThumbs.length > 0) thumbFile = zip.file(possibleThumbs[0]);
+                if (autoThumbs.length > 0) {
+                  thumbFile = zip.file(autoThumbs[0]);
+                  console.log(`[OctoStudio Viewer] Fallback thumbnail selected: ${autoThumbs[0]}`);
+                }
               }
 
               if (thumbFile) {
@@ -110,55 +130,104 @@ export default {
                 previewImg.style.marginTop = "10px";
                 previewImg.style.borderRadius = "8px";
                 previewImg.style.border = "1px solid var(--primary-low-mid)";
+                previewImg.alt = "OctoStudio Preview";
                 
                 previewImg.src = URL.createObjectURL(imgData);
                 link.after(previewImg);
+                console.log("[OctoStudio Viewer] Preview image injected into the DOM.");
+              } else {
+                console.warn("[OctoStudio Viewer] No suitable thumbnail found.");
               }
             } catch (e) {
-              console.error("[OctoStudio Viewer] Processing failed:", e.message);
+              console.error("[OctoStudio Viewer] Preview rendering failed completely: ", e);
             }
 
+            // 3. CLICK INTERCEPTION: Pure Blob download execution
             link.addEventListener("click", async (event) => {
-                // Verifica se o clique foi diretamente no link (ignora cliques no preview de imagem)
-                if (event.target.tagName.toLowerCase() !== 'a') return;
+              console.log("[OctoStudio Viewer] Click event fired.");
+              
+              // Forcefully block all other event listeners (Discourse router, Safari native handlers)
+              event.preventDefault();
+              event.stopPropagation();
+              event.stopImmediatePropagation();
+              console.log("[OctoStudio Viewer] Event propagation halted.");
+
+              const targetElement = event.target.closest('a');
+              if (!targetElement) {
+                console.warn("[OctoStudio Viewer] Click target is not an anchor element. Ignoring.");
+                return;
+              }
+              
+              if (targetElement.dataset.loading === "true") {
+                console.warn("[OctoStudio Viewer] Click ignored. Download is already in progress.");
+                return;
+              }
+
+              // UI State: Loading (Visual and Functional Lock)
+              targetElement.dataset.loading = "true";
+              targetElement.style.opacity = "0.5";
+              targetElement.style.pointerEvents = "none";
+              console.log("[OctoStudio Viewer] UI locked: opacity reduced and pointer-events disabled.");
+
+              try {
+                const targetUrl = targetElement.dataset.targetUrl;
+                console.log(`[OctoStudio Viewer] Initiating download fetch for target URL: ${targetUrl}`);
                 
-                event.preventDefault();
-
-                try {
-                  const response = await fetch(link.href);
-                  if (!response.ok) throw new Error(`HTTP Status: ${response.status}`);
-
-                  const arrayBuffer = await response.arrayBuffer();
-                  
-                  // Recria o arquivo na memória do navegador forçando o novo MIME Type
-                  const blob = new Blob([arrayBuffer], { type: OCTOSTUDIO_MIME_TYPE });
-                  console.log("[MIME Test] Tipo do Blob gerado:", blob.type);
-                  const blobUrl = URL.createObjectURL(blob);
-
-                  // Cria um elemento <a> temporário para forçar o download pelo navegador
-                  const tempLink = document.createElement("a");
-                  tempLink.href = blobUrl;
-                  
-                  // Extrai o nome original do arquivo da URL ou define um fallback
-                  const urlParts = link.href.split('/');
-                  const fileName = urlParts[urlParts.length - 1].split('?')[0] || "project.octostudio";
-                  tempLink.download = fileName;
-
-                  // Aciona o download
-                  document.body.appendChild(tempLink);
-                  tempLink.click();
-
-                  // Limpeza de memória e remoção do elemento temporário
-                  document.body.removeChild(tempLink);
-                  setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
-
-                } catch (e) {
-                  console.error("[OctoStudio Viewer] Falha ao interceptar download:", e.message);
-                  // Fallback: executa o comportamento padrão caso a interceptação falhe
-                  window.location.href = link.href;
+                const downloadResponse = await fetch(targetUrl);
+                
+                // Logging HTTP Headers for deep debugging
+                console.log("[OctoStudio Viewer] --- HTTP Headers ---");
+                for (const [key, value] of downloadResponse.headers.entries()) {
+                  console.log(`${key}: ${value}`);
                 }
-              });
+                console.log("[OctoStudio Viewer] --- End of HTTP Headers ---");
 
+                if (!downloadResponse.ok) {
+                  throw new Error(`Download HTTP Status: ${downloadResponse.status}`);
+                }
+
+                const buffer = await downloadResponse.arrayBuffer();
+                console.log(`[OctoStudio Viewer] Download array buffer received. Size: ${buffer.byteLength} bytes.`);
+                
+                // Filename extraction
+                const urlParts = targetUrl.split('/');
+                let fileName = urlParts[urlParts.length - 1].split('?')[0];
+                if (!fileName.endsWith('.octostudio')) {
+                  fileName += '.octostudio';
+                  console.log(`[OctoStudio Viewer] Enforced .octostudio extension. New filename: ${fileName}`);
+                } else {
+                  console.log(`[OctoStudio Viewer] Valid filename extracted: ${fileName}`);
+                }
+
+                // Blob Creation & Download Trigger
+                console.log(`[OctoStudio Viewer] Creating Blob with MIME type: ${OCTOSTUDIO_MIME_TYPE}`);
+                const blob = new Blob([buffer], { type: OCTOSTUDIO_MIME_TYPE });
+                const blobUrl = URL.createObjectURL(blob);
+
+                const tempLink = document.createElement("a");
+                tempLink.href = blobUrl;
+                tempLink.download = fileName;
+
+                console.log("[OctoStudio Viewer] Injecting temporary anchor to trigger OS download...");
+                document.body.appendChild(tempLink);
+                tempLink.click();
+                document.body.removeChild(tempLink);
+              
+                setTimeout(() => {
+                  URL.revokeObjectURL(blobUrl);
+                  console.log("[OctoStudio Viewer] Blob URL revoked to free memory.");
+                }, 1000);
+
+              } catch (e) {
+                console.error("[OctoStudio Viewer] Critical failure during file processing/download: ", e);
+              } finally {
+                // UI State: Restore (Visual and Functional Unlock)
+                targetElement.dataset.loading = "false";
+                targetElement.style.opacity = "1";
+                targetElement.style.pointerEvents = "auto";
+                console.log("[OctoStudio Viewer] Click processing completed. Link state restored.");
+              }
+            });
           });
         },
         { id: "octostudio-handler" }
